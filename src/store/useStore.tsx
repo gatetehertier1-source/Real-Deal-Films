@@ -1,5 +1,8 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useState, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
 import type { Movie } from "../data/tmdb";
+import { ensureSupabaseUser } from "../lib/bootstrapAnonymousUser";
+import { fetchUserFavorites, fetchUserWatchlist, fetchUserWatchedProgress, toggleFavoritesRow, toggleWatchlistRow, upsertWatchedProgress } from "../lib/userCatalog";
+
 
 type Profile = {
   id: string;
@@ -53,6 +56,11 @@ const DEFAULT_PROFILES: Profile[] = [
 
 const STORAGE_KEY = "nexus-stream-state-v1";
 
+function safeMovieIdsUnique(ids: number[]) {
+  return Array.from(new Set(ids.filter((n) => Number.isFinite(n))));
+}
+
+
 const StoreContext = createContext<(StoreState & StoreActions) | null>(null);
 
 function loadInitial(): Partial<StoreState> {
@@ -80,15 +88,17 @@ export function StoreProvider({ children }: { children: ReactNode }) {
   const [detailMovie, setDetailMovie] = useState<Movie | null>(null);
   const [sidebarOpen, setSidebarOpen] = useState<boolean>(true);
 
-  // Persist
+  // Persist only UI-ish state locally (profile + genre + selected profile)
+  // Watchlist/favorites/progress are persisted to Supabase.
   useEffect(() => {
-    const payload = { activeProfileId, watchlist, watched, activeGenre };
+    const payload = { activeProfileId, activeGenre };
     try {
       localStorage.setItem(STORAGE_KEY, JSON.stringify(payload));
     } catch {
       /* ignore */
     }
-  }, [activeProfileId, watchlist, watched, activeGenre]);
+  }, [activeProfileId, watched, activeGenre]);
+
 
   // Lock body scroll when player/search open
   useEffect(() => {
@@ -99,25 +109,87 @@ export function StoreProvider({ children }: { children: ReactNode }) {
     };
   }, [playerMovie, searchOpen]);
 
-  const toggleWatchlist = useCallback((id: number) => {
-    setWatchlist((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
+  const supabaseUserIdRef = useRef<string | null>(null);
+
+  // Load user persisted state from Supabase.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const userId = await ensureSupabaseUser();
+        if (cancelled) return;
+        supabaseUserIdRef.current = userId;
+
+        const [wl, favs, prog] = await Promise.all([
+          fetchUserWatchlist(userId),
+          fetchUserFavorites(userId),
+          fetchUserWatchedProgress(userId),
+        ]);
+
+        if (cancelled) return;
+        setWatchlist(wl);
+        setFavorites(favs);
+        setWatched(prog);
+      } catch (e) {
+        // eslint-disable-next-line no-console
+        console.warn("Supabase sync failed; falling back to local defaults.", e);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
   }, []);
+
+  const toggleWatchlist = useCallback((id: number) => {
+    const userId = supabaseUserIdRef.current;
+    setWatchlist((prev) => {
+      const shouldAdd = !prev.includes(id);
+      // Fire-and-forget sync.
+      if (userId) {
+        toggleWatchlistRow(userId, id, shouldAdd).catch(() => {
+          // eslint-disable-next-line no-console
+          console.warn("Failed to sync watchlist to Supabase");
+        });
+      }
+      return shouldAdd ? safeMovieIdsUnique([...prev, id]) : prev.filter((x) => x !== id);
+    });
+  }, []);
+
 
   const isInWatchlist = useCallback((id: number) => watchlist.includes(id), [watchlist]);
 
   const toggleFavorite = useCallback((id: number) => {
-    setFavorites((prev) =>
-      prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]
-    );
+    const userId = supabaseUserIdRef.current;
+    setFavorites((prev) => {
+      const shouldAdd = !prev.includes(id);
+      if (userId) {
+        toggleFavoritesRow(userId, id, shouldAdd).catch(() => {
+          // eslint-disable-next-line no-console
+          console.warn("Failed to sync favorites to Supabase");
+        });
+      }
+      return shouldAdd ? safeMovieIdsUnique([...prev, id]) : prev.filter((x) => x !== id);
+    });
   }, []);
+
 
   const isFavorite = useCallback((id: number) => favorites.includes(id), [favorites]);
 
   const setProgress = useCallback((id: number, p: number) => {
-    setWatched((prev) => ({ ...prev, [id]: Math.max(0, Math.min(1, p)) }));
+    const userId = supabaseUserIdRef.current;
+    const clamped = Math.max(0, Math.min(1, p));
+
+    setWatched((prev) => ({ ...prev, [id]: clamped }));
+
+    if (userId) {
+      upsertWatchedProgress(userId, id, clamped).catch(() => {
+        // eslint-disable-next-line no-console
+        console.warn("Failed to sync progress to Supabase");
+      });
+    }
   }, []);
+
 
   const activeProfile = useMemo(
     () => profiles.find((p) => p.id === activeProfileId) ?? profiles[0],
